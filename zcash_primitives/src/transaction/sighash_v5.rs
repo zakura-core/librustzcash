@@ -30,10 +30,42 @@ fn hasher(personal: &[u8; 16]) -> StateWrite {
     StateWrite(Params::new().hash_length(32).personal(personal).to_state())
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct Zip244SighashDigests {
+    amounts: Blake2bHash,
+    scriptpubkeys: Blake2bHash,
+}
+
+impl Zip244SighashDigests {
+    pub(super) fn new<A: TransparentAuthorizingContext>(bundle: &transparent::Bundle<A>) -> Self {
+        let mut amounts = hasher(ZCASH_TRANSPARENT_AMOUNTS_HASH_PERSONALIZATION);
+        Array::write(
+            &mut amounts,
+            bundle.authorization.input_amounts(),
+            |w, amount| w.write_all(&amount.to_i64_le_bytes()),
+        )
+        .unwrap();
+
+        let mut scriptpubkeys = hasher(ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION);
+        Array::write(
+            &mut scriptpubkeys,
+            bundle.authorization.input_scriptpubkeys(),
+            |w, script| script.write(w),
+        )
+        .unwrap();
+
+        Self {
+            amounts: amounts.finalize(),
+            scriptpubkeys: scriptpubkeys.finalize(),
+        }
+    }
+}
+
 /// Implements [ZIP 244 section S.2](https://zips.z.cash/zip-0244#s-2-transparent-sig-digest).
 pub(super) fn transparent_sig_digest<A: TransparentAuthorizingContext>(
     tx_data: Option<(&transparent::Bundle<A>, &TransparentDigests<Blake2bHash>)>,
     input: &SignableInput<'_>,
+    precomputed: Option<&Zip244SighashDigests>,
 ) -> Blake2bHash {
     match tx_data {
         // No transparent inputs or outputs.
@@ -55,27 +87,33 @@ pub(super) fn transparent_sig_digest<A: TransparentAuthorizingContext>(
                 txid_digests.prevouts_digest
             };
 
-            let amounts_digest = {
+            let amounts_digest = if flag_anyonecanpay {
+                let h = hasher(ZCASH_TRANSPARENT_AMOUNTS_HASH_PERSONALIZATION);
+                h.finalize()
+            } else if let Some(precomputed) = precomputed {
+                precomputed.amounts
+            } else {
                 let mut h = hasher(ZCASH_TRANSPARENT_AMOUNTS_HASH_PERSONALIZATION);
-                if !flag_anyonecanpay {
-                    Array::write(&mut h, bundle.authorization.input_amounts(), |w, amount| {
-                        w.write_all(&amount.to_i64_le_bytes())
-                    })
-                    .unwrap();
-                }
+                Array::write(&mut h, bundle.authorization.input_amounts(), |w, amount| {
+                    w.write_all(&amount.to_i64_le_bytes())
+                })
+                .unwrap();
                 h.finalize()
             };
 
-            let scripts_digest = {
+            let scripts_digest = if flag_anyonecanpay {
+                let h = hasher(ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION);
+                h.finalize()
+            } else if let Some(precomputed) = precomputed {
+                precomputed.scriptpubkeys
+            } else {
                 let mut h = hasher(ZCASH_TRANSPARENT_SCRIPTS_HASH_PERSONALIZATION);
-                if !flag_anyonecanpay {
-                    Array::write(
-                        &mut h,
-                        bundle.authorization.input_scriptpubkeys(),
-                        |w, script| script.write(w),
-                    )
-                    .unwrap();
-                }
+                Array::write(
+                    &mut h,
+                    bundle.authorization.input_scriptpubkeys(),
+                    |w, script| script.write(w),
+                )
+                .unwrap();
                 h.finalize()
             };
 
@@ -137,6 +175,30 @@ pub fn v5_signature_hash<
     signable_input: &SignableInput<'_>,
     txid_parts: &TxDigests<Blake2bHash>,
 ) -> Blake2bHash {
+    v5_signature_hash_inner(tx, signable_input, txid_parts, None)
+}
+
+pub(super) fn v5_signature_hash_with_precomputed<
+    TA: TransparentAuthorizingContext,
+    A: Authorization<TransparentAuth = TA>,
+>(
+    tx: &TransactionData<A>,
+    signable_input: &SignableInput<'_>,
+    txid_parts: &TxDigests<Blake2bHash>,
+    transparent_sighash_digests: Option<&Zip244SighashDigests>,
+) -> Blake2bHash {
+    v5_signature_hash_inner(tx, signable_input, txid_parts, transparent_sighash_digests)
+}
+
+fn v5_signature_hash_inner<
+    TA: TransparentAuthorizingContext,
+    A: Authorization<TransparentAuth = TA>,
+>(
+    tx: &TransactionData<A>,
+    signable_input: &SignableInput<'_>,
+    txid_parts: &TxDigests<Blake2bHash>,
+    transparent_sighash_digests: Option<&Zip244SighashDigests>,
+) -> Blake2bHash {
     // The caller must provide the transparent digests if and only if the transaction has a
     // transparent component.
     assert_eq!(
@@ -153,6 +215,7 @@ pub fn v5_signature_hash<
                 .as_ref()
                 .zip(txid_parts.transparent_digests.as_ref()),
             signable_input,
+            transparent_sighash_digests,
         ),
         txid_parts.sapling_digest,
         txid_parts.orchard_digest,

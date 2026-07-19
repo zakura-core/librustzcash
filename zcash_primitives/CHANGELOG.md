@@ -10,6 +10,10 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `zcash_primitives::transaction::sighash::PrecomputedSighashData` for reusing
+  transaction-wide digests across signature hash calculations.
+
 ## [0.29.0] - 2026-07-09
 
 ### Added

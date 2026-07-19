@@ -3,8 +3,10 @@ use blake2b_simd::Hash as Blake2bHash;
 use ::transparent::sighash::TransparentAuthorizingContext;
 
 use crate::transaction::{
-    Authorization, TransactionData, TxDigests, sighash::SignableInput,
-    sighash_v5::transparent_sig_digest, txid::to_hash_v6,
+    Authorization, TransactionData, TxDigests,
+    sighash::SignableInput,
+    sighash_v5::{Zip244SighashDigests, transparent_sig_digest},
+    txid::to_hash_v6,
 };
 
 pub fn v6_signature_hash<
@@ -14,6 +16,30 @@ pub fn v6_signature_hash<
     tx: &TransactionData<A>,
     signable_input: &SignableInput<'_>,
     txid_parts: &TxDigests<Blake2bHash>,
+) -> Blake2bHash {
+    v6_signature_hash_inner(tx, signable_input, txid_parts, None)
+}
+
+pub(super) fn v6_signature_hash_with_precomputed<
+    TA: TransparentAuthorizingContext,
+    A: Authorization<TransparentAuth = TA>,
+>(
+    tx: &TransactionData<A>,
+    signable_input: &SignableInput<'_>,
+    txid_parts: &TxDigests<Blake2bHash>,
+    transparent_sighash_digests: Option<&Zip244SighashDigests>,
+) -> Blake2bHash {
+    v6_signature_hash_inner(tx, signable_input, txid_parts, transparent_sighash_digests)
+}
+
+fn v6_signature_hash_inner<
+    TA: TransparentAuthorizingContext,
+    A: Authorization<TransparentAuth = TA>,
+>(
+    tx: &TransactionData<A>,
+    signable_input: &SignableInput<'_>,
+    txid_parts: &TxDigests<Blake2bHash>,
+    transparent_sighash_digests: Option<&Zip244SighashDigests>,
 ) -> Blake2bHash {
     // The caller must provide the transparent digests if and only if the
     // transaction has a transparent component.
@@ -30,6 +56,7 @@ pub fn v6_signature_hash<
                 .as_ref()
                 .zip(txid_parts.transparent_digests.as_ref()),
             signable_input,
+            transparent_sighash_digests,
         ),
         txid_parts.sapling_digest,
         txid_parts.orchard_digest,

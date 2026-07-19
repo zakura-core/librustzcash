@@ -128,12 +128,94 @@ fn sapling_outputs_hash(outputs: &[OutputDescription<GrothProofBytes>]) -> Blake
         .hash(&data)
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct V4SighashDigests {
+    prevouts: Blake2bHash,
+    sequence: Blake2bHash,
+    outputs: Blake2bHash,
+    joinsplits: Option<Blake2bHash>,
+    sapling_spends: Option<Blake2bHash>,
+    sapling_outputs: Option<Blake2bHash>,
+}
+
+impl V4SighashDigests {
+    pub(super) fn new<
+        SA: sapling::bundle::Authorization<SpendProof = GrothProofBytes, OutputProof = GrothProofBytes>,
+        A: Authorization<SaplingAuth = SA>,
+    >(
+        tx: &TransactionData<A>,
+    ) -> Self {
+        let transparent_inputs: &[TxIn<A::TransparentAuth>] = tx
+            .transparent_bundle
+            .as_ref()
+            .map_or(&[], |b| b.vin.as_slice());
+        let transparent_outputs: &[TxOut] = tx
+            .transparent_bundle
+            .as_ref()
+            .map_or(&[], |b| b.vout.as_slice());
+
+        let joinsplits = tx
+            .sprout_bundle
+            .as_ref()
+            .filter(|bundle| !bundle.joinsplits.is_empty())
+            .map(|bundle| {
+                joinsplits_hash(
+                    tx.consensus_branch_id,
+                    &bundle.joinsplits,
+                    &bundle.joinsplit_pubkey,
+                )
+            });
+
+        let sapling_spends = tx
+            .sapling_bundle
+            .as_ref()
+            .filter(|bundle| !bundle.shielded_spends().is_empty())
+            .map(|bundle| sapling_spends_hash(bundle.shielded_spends()));
+        let sapling_outputs = tx
+            .sapling_bundle
+            .as_ref()
+            .filter(|bundle| !bundle.shielded_outputs().is_empty())
+            .map(|bundle| sapling_outputs_hash(bundle.shielded_outputs()));
+
+        Self {
+            prevouts: prevout_hash(transparent_inputs),
+            sequence: sequence_hash(transparent_inputs),
+            outputs: outputs_hash(transparent_outputs),
+            joinsplits,
+            sapling_spends,
+            sapling_outputs,
+        }
+    }
+}
+
 pub fn v4_signature_hash<
     SA: sapling::bundle::Authorization<SpendProof = GrothProofBytes, OutputProof = GrothProofBytes>,
     A: Authorization<SaplingAuth = SA>,
 >(
     tx: &TransactionData<A>,
     signable_input: &SignableInput<'_>,
+) -> Blake2bHash {
+    v4_signature_hash_inner(tx, signable_input, None)
+}
+
+pub(super) fn v4_signature_hash_with_precomputed<
+    SA: sapling::bundle::Authorization<SpendProof = GrothProofBytes, OutputProof = GrothProofBytes>,
+    A: Authorization<SaplingAuth = SA>,
+>(
+    tx: &TransactionData<A>,
+    signable_input: &SignableInput<'_>,
+    precomputed: &V4SighashDigests,
+) -> Blake2bHash {
+    v4_signature_hash_inner(tx, signable_input, Some(precomputed))
+}
+
+fn v4_signature_hash_inner<
+    SA: sapling::bundle::Authorization<SpendProof = GrothProofBytes, OutputProof = GrothProofBytes>,
+    A: Authorization<SaplingAuth = SA>,
+>(
+    tx: &TransactionData<A>,
+    signable_input: &SignableInput<'_>,
+    precomputed: Option<&V4SighashDigests>,
 ) -> Blake2bHash {
     let hash_type = signable_input.hash_type();
     if tx.version.has_overwinter() {
@@ -151,10 +233,13 @@ pub fn v4_signature_hash<
         update_hash!(
             h,
             hash_type & SIGHASH_ANYONECANPAY == 0,
-            prevout_hash(
-                tx.transparent_bundle
-                    .as_ref()
-                    .map_or(&[], |b| b.vin.as_slice())
+            precomputed.map_or_else(
+                || prevout_hash(
+                    tx.transparent_bundle
+                        .as_ref()
+                        .map_or(&[], |b| b.vin.as_slice())
+                ),
+                |digests| digests.prevouts,
             )
         );
         update_hash!(
@@ -162,10 +247,13 @@ pub fn v4_signature_hash<
             (hash_type & SIGHASH_ANYONECANPAY) == 0
                 && (hash_type & SIGHASH_MASK) != SIGHASH_SINGLE
                 && (hash_type & SIGHASH_MASK) != SIGHASH_NONE,
-            sequence_hash(
-                tx.transparent_bundle
-                    .as_ref()
-                    .map_or(&[], |b| b.vin.as_slice())
+            precomputed.map_or_else(
+                || sequence_hash(
+                    tx.transparent_bundle
+                        .as_ref()
+                        .map_or(&[], |b| b.vin.as_slice())
+                ),
+                |digests| digests.sequence,
             )
         );
 
@@ -173,12 +261,18 @@ pub fn v4_signature_hash<
             && (hash_type & SIGHASH_MASK) != SIGHASH_NONE
         {
             h.update(
-                outputs_hash(
-                    tx.transparent_bundle
-                        .as_ref()
-                        .map_or(&[], |b| b.vout.as_slice()),
-                )
-                .as_bytes(),
+                precomputed
+                    .map_or_else(
+                        || {
+                            outputs_hash(
+                                tx.transparent_bundle
+                                    .as_ref()
+                                    .map_or(&[], |b| b.vout.as_slice()),
+                            )
+                        },
+                        |digests| digests.outputs,
+                    )
+                    .as_bytes(),
             );
         } else if (hash_type & SIGHASH_MASK) == SIGHASH_SINGLE {
             match (tx.transparent_bundle.as_ref(), signable_input) {
@@ -191,36 +285,54 @@ pub fn v4_signature_hash<
             h.update(&[0; 32]);
         };
 
-        update_hash!(
-            h,
-            !tx.sprout_bundle
-                .as_ref()
-                .is_none_or(|b| b.joinsplits.is_empty()),
-            {
-                let bundle = tx.sprout_bundle.as_ref().unwrap();
-                joinsplits_hash(
-                    tx.consensus_branch_id,
-                    &bundle.joinsplits,
-                    &bundle.joinsplit_pubkey,
-                )
-            }
+        let joinsplits = precomputed.map_or_else(
+            || {
+                tx.sprout_bundle
+                    .as_ref()
+                    .filter(|bundle| !bundle.joinsplits.is_empty())
+                    .map(|bundle| {
+                        joinsplits_hash(
+                            tx.consensus_branch_id,
+                            &bundle.joinsplits,
+                            &bundle.joinsplit_pubkey,
+                        )
+                    })
+            },
+            |digests| digests.joinsplits,
         );
+        match joinsplits {
+            Some(digest) => h.update(digest.as_bytes()),
+            None => h.update(&[0; 32]),
+        };
 
         if tx.version.has_sapling() {
-            update_hash!(
-                h,
-                !tx.sapling_bundle
-                    .as_ref()
-                    .is_none_or(|b| b.shielded_spends().is_empty()),
-                sapling_spends_hash(tx.sapling_bundle.as_ref().unwrap().shielded_spends())
+            let sapling_spends = precomputed.map_or_else(
+                || {
+                    tx.sapling_bundle
+                        .as_ref()
+                        .filter(|bundle| !bundle.shielded_spends().is_empty())
+                        .map(|bundle| sapling_spends_hash(bundle.shielded_spends()))
+                },
+                |digests| digests.sapling_spends,
             );
-            update_hash!(
-                h,
-                !tx.sapling_bundle
-                    .as_ref()
-                    .is_none_or(|b| b.shielded_outputs().is_empty()),
-                sapling_outputs_hash(tx.sapling_bundle.as_ref().unwrap().shielded_outputs())
+            match sapling_spends {
+                Some(digest) => h.update(digest.as_bytes()),
+                None => h.update(&[0; 32]),
+            };
+
+            let sapling_outputs = precomputed.map_or_else(
+                || {
+                    tx.sapling_bundle
+                        .as_ref()
+                        .filter(|bundle| !bundle.shielded_outputs().is_empty())
+                        .map(|bundle| sapling_outputs_hash(bundle.shielded_outputs()))
+                },
+                |digests| digests.sapling_outputs,
             );
+            match sapling_outputs {
+                Some(digest) => h.update(digest.as_bytes()),
+                None => h.update(&[0; 32]),
+            };
         }
         h.update(&tx.lock_time.to_le_bytes());
         h.update(&u32::from(tx.expiry_height).to_le_bytes());
